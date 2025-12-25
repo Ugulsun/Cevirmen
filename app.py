@@ -37,21 +37,25 @@ def get_nobel_folder_id(service):
     return items[0]['id']
 
 def save_project_to_drive(service, folder_id, project_data, project_name):
-    """Proje verilerini JSON olarak Drive'a kaydeder."""
+    """Proje verilerini JSON olarak Drive'a kaydeder (Basit Mod)."""
     file_metadata = {
         'name': 'project_data.json',
         'mimeType': 'application/json',
         'parents': [folder_id]
     }
     
-    # Mevcut dosyayı bul ve güncelle (yoksa yarat)
+    # Mevcut dosyayı bul
     query = f"name = 'project_data.json' and '{folder_id}' in parents and trashed = false"
     results = service.files().list(q=query, fields="files(id)").execute()
     items = results.get('files', [])
     
-    # Veriyi hazırla
-    media = MediaIoBaseUpload(io.BytesIO(json.dumps(project_data, ensure_ascii=False, indent=4).encode('utf-8')),
-                              mimetype='application/json', resumable=False)
+    # JSON verisini hazırla
+    json_bytes = json.dumps(project_data, ensure_ascii=False, indent=4).encode('utf-8')
+    
+    # KRİTİK DÜZELTME BURADA: resumable=False yapıyoruz
+    media = MediaIoBaseUpload(io.BytesIO(json_bytes),
+                              mimetype='application/json', 
+                              resumable=False) 
     
     if items:
         # Güncelle
