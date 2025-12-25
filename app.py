@@ -28,7 +28,7 @@ def get_drive_service():
 
 def get_nobel_folder_id(service):
     """NOBEL_CEVIRI_PROJELERI klasörünün ID'sini bulur, yoksa uyarır."""
-    query = "name = 'NOBEL_CEVIRI_PROJELERI' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    query = "name = '-CEVIRI PROJELERI' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     results = service.files().list(q=query, fields="files(id, name)").execute()
     items = results.get('files', [])
     if not items:
