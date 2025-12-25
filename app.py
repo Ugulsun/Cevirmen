@@ -52,7 +52,7 @@ def save_project_to_drive(service, folder_id, project_data, project_name):
     # JSON verisini hazırla
     json_bytes = json.dumps(project_data, ensure_ascii=False, indent=4).encode('utf-8')
     
-    # KRİTİK DÜZELTME BURADA: resumable=False yapıyoruz
+    # KRİTİK DÜZELTME: resumable=False
     media = MediaIoBaseUpload(io.BytesIO(json_bytes),
                               mimetype='application/json', 
                               resumable=False) 
@@ -85,12 +85,6 @@ def load_project_from_drive(service, folder_id):
     fh.seek(0)
     return json.load(fh)
 
-def yedekle_eski_dosya(service, folder_id, project_name):
-    """Günü değişmişse eski dosyayı ESKİ klasörüne atar."""
-    # Bu özellik karmaşıklığı artırmamak için şimdilik basit tutuldu:
-    # Her kayıtta üzerine yazar. İstenirse tarihli kopya oluşturulabilir.
-    pass
-
 # --- YARDIMCI METİN İŞLEMLERİ ---
 def metni_parcala(metin):
     return [p.strip() for p in metin.split('\n\n') if p.strip()]
@@ -102,11 +96,9 @@ def paragraf_eslestir(orjinal_liste, ceviri_liste):
     for i, orj in enumerate(orjinal_liste):
         durum = "bekliyor"
         ceviri = ""
-        # Basit mantık: Sıra numarası tutuyorsa eşleştir.
-        # (Gelişmiş versiyonda benzerlik analizi yapılabilir)
         if i < len_ceviri:
             ceviri = ceviri_liste[i]
-            durum = "onaylandi" # Zaten çevrilmiş dosya olduğu için onaylı sayıyoruz
+            durum = "onaylandi"
         
         data.append({
             "id": i,
@@ -156,7 +148,6 @@ if st.session_state.aktif_proje is None:
     tabs = st.tabs(["Mevcut Projeler", "Yeni Proje Oluştur"])
     
     with tabs[0]:
-        # Drive'daki proje klasörlerini listele
         q = f"'{ana_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         results = srv.files().list(q=q, fields="files(id, name)").execute()
         projeler = results.get('files', [])
@@ -168,7 +159,6 @@ if st.session_state.aktif_proje is None:
             col1, col2 = st.columns([3, 1])
             col1.subheader(f"📁 {p['name']}")
             if col2.button("Projeyi Aç", key=p['id']):
-                # Projeyi Yükle
                 data = load_project_from_drive(srv, p['id'])
                 if data:
                     st.session_state.aktif_proje = data
@@ -181,11 +171,11 @@ if st.session_state.aktif_proje is None:
         st.subheader("Yeni Proje Başlat")
         proje_adi = st.text_input("Proje Adı (Klasör Adı)")
         dosya_orj = st.file_uploader("1. Orijinal Dosya (Zorunlu)", type=['txt', 'docx', 'pdf'])
-        dosya_cev = st.file_uploader("2. Yarım Çeviri (Varsa)", type=['txt', 'docx', 'pdf'], help="Elinizdeki yarım çeviriyi yükleyin, sistem kaldığınız yeri anlar.")
+        dosya_cev = st.file_uploader("2. Yarım Çeviri (Varsa)", type=['txt', 'docx', 'pdf'], help="Varsa yarım çeviriyi yükle.")
         
         if st.button("Oluştur") and proje_adi and dosya_orj:
-            with st.spinner("Drive klasörü oluşturuluyor ve analiz ediliyor..."):
-                # 1. Metinleri Oku
+            with st.spinner("Drive klasörü oluşturuluyor..."):
+                # Dosya okuma
                 def read_file(f):
                     if f.name.endswith('.pdf'):
                         r = PdfReader(f); return "".join([p.extract_text() for p in r.pages])
@@ -196,7 +186,6 @@ if st.session_state.aktif_proje is None:
                 txt_orj = read_file(dosya_orj)
                 txt_cev = read_file(dosya_cev) if dosya_cev else ""
                 
-                # 2. Parçala ve Eşleştir
                 list_orj = metni_parcala(txt_orj)
                 list_cev = metni_parcala(txt_cev)
                 
@@ -205,7 +194,7 @@ if st.session_state.aktif_proje is None:
                     "paragraflar": paragraf_eslestir(list_orj, list_cev)
                 }
                 
-                # 3. Drive Klasörü Yarat
+                # Drive işlemleri
                 folder_meta = {
                     'name': proje_adi,
                     'mimeType': 'application/vnd.google-apps.folder',
@@ -214,12 +203,10 @@ if st.session_state.aktif_proje is None:
                 folder = srv.files().create(body=folder_meta, fields='id').execute()
                 new_folder_id = folder.get('id')
                 
-                # 4. Veriyi Kaydet
                 save_project_to_drive(srv, new_folder_id, project_data, proje_adi)
-                
                 st.success(f"Proje oluşturuldu! {len(list_cev)} paragraf hazır eşleştirildi.")
 
-# --- EKRAN 2: ÇEVİRİ EDİTÖRÜ ---
+# --- EKRAN 2: EDİTÖR ---
 else:
     proje = st.session_state.aktif_proje
     folder_id = st.session_state.aktif_folder_id
@@ -227,79 +214,66 @@ else:
     
     st.header(f"📝 {proje['meta']['ad']}")
     
-    # İstatistik
     toplam = len(paragraflar)
     biten = len([p for p in paragraflar if p['durum'] == 'onaylandi'])
     st.progress(biten/toplam, text=f"İlerleme: {biten}/{toplam}")
     
-    # Navigasyon
     if "cursor" not in st.session_state:
-        # İlk 'bekliyor' olanı bul
         first_waiting = next((i for i, p in enumerate(paragraflar) if p['durum'] == 'bekliyor'), 0)
         st.session_state.cursor = first_waiting
 
-    col_nav1, col_nav2, col_nav3, col_nav4 = st.columns([1, 1, 2, 1])
-    if col_nav1.button("⬅️ Önceki"): st.session_state.cursor = max(0, st.session_state.cursor - 1)
-    if col_nav2.button("Sonraki ➡️"): st.session_state.cursor = min(toplam - 1, st.session_state.cursor + 1)
+    col1, col2, col3, col4 = st.columns([1, 1, 2, 1])
+    if col1.button("⬅️ Önceki"): st.session_state.cursor = max(0, st.session_state.cursor - 1)
+    if col2.button("Sonraki ➡️"): st.session_state.cursor = min(toplam - 1, st.session_state.cursor + 1)
     
-    # Gitmek istenen paragraf
-    yeni_cursor = col_nav3.number_input("Paragraf No Git", min_value=1, max_value=toplam, value=st.session_state.cursor + 1) - 1
+    yeni_cursor = col3.number_input("Git", min_value=1, max_value=toplam, value=st.session_state.cursor + 1) - 1
     if yeni_cursor != st.session_state.cursor:
         st.session_state.cursor = yeni_cursor
         st.rerun()
 
-    if col_nav4.button("⏭️ İlk Boşa Git"):
+    if col4.button("⏭️ Boşa Git"):
         next_waiting = next((i for i, p in enumerate(paragraflar) if p['durum'] == 'bekliyor'), st.session_state.cursor)
         st.session_state.cursor = next_waiting
         st.rerun()
 
-    # --- EDİTÖR ---
+    # Editör
     idx = st.session_state.cursor
     current_p = paragraflar[idx]
     
     st.divider()
     st.markdown(f"### Paragraf {idx + 1}")
     
-    col_sol, col_sag = st.columns(2)
-    
-    with col_sol:
+    c_sol, c_sag = st.columns(2)
+    with c_sol:
         st.info(current_p['orjinal'])
     
-    with col_sag:
-        # Çeviri yoksa otomatik yap
+    with c_sag:
         if not current_p['ceviri'] and api_key:
             with st.spinner("Çevriliyor..."):
                 oto_ceviri = ceviri_yap_gemini(current_p['orjinal'], api_key, "Sen profesyonel çevirmensin.")
-                current_p['ceviri'] = oto_ceviri # Geçici kaydet
+                current_p['ceviri'] = oto_ceviri
         
         yeni_metin = st.text_area("Çeviri", value=current_p['ceviri'], height=200)
         
-        if st.button("✅ Onayla ve Kaydet", type="primary"):
-            # Güncelle
+        if st.button("✅ Onayla", type="primary"):
             current_p['ceviri'] = yeni_metin
             current_p['durum'] = 'onaylandi'
-            
-            # Drive'a Kaydet (Kalıcılık!)
             save_project_to_drive(srv, folder_id, proje, proje['meta']['ad'])
             
-            # Sonrakine geç
             if idx < toplam - 1:
                 st.session_state.cursor += 1
             st.toast("Kaydedildi!")
             st.rerun()
-
-    # --- İNDİRME SEÇENEKLERİ ---
+            
     st.divider()
-    st.subheader("📤 Dışa Aktar")
-    if st.button("Word Olarak İndir"):
+    if st.button("Word İndir"):
         doc = Document()
         doc.add_heading(proje['meta']['ad'], 0)
         for p in paragraflar:
             if p['durum'] == 'onaylandi':
                 doc.add_paragraph(p['ceviri'])
             else:
-                doc.add_paragraph(f"--- [Çevrilmedi: {p['orjinal'][:20]}...] ---")
-        
+                doc.add_paragraph(f"--- [Çevrilmedi] ---")
         bio = io.BytesIO()
         doc.save(bio)
-        st.download_button("Dosyayı İndir", bio.getvalue(), file_name=f"{proje['meta']['ad']}_Ceviri.docx")
+        st.download_button("Dosyayı İndir", bio.getvalue(), file_name=f"{proje['meta']['ad']}.docx")
