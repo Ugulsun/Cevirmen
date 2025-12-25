@@ -2,7 +2,7 @@ import streamlit as st
 import google.genai as genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-# MediaIoBaseUpload YERİNE MediaInMemoryUpload KULLANIYORUZ:
+# RAM Yöntemi (Kota sorununu çözer)
 from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 import json
@@ -42,11 +42,11 @@ def get_nobel_folder_id(service):
         st.error(f"Klasör Hatası: {e}")
         st.stop()
 
-# --- YENİ KAYIT FONKSİYONU (RAM MOTORLU) ---
+# --- YENİ KAYIT FONKSİYONU (RAM + SAHİPLİK AYARI) ---
 def save_project_to_drive(service, folder_id, project_data, project_name):
     """
     Veriyi Google Doc olarak kaydeder.
-    MediaInMemoryUpload kullanarak 'Resumable' hatasını %100 bypass eder.
+    MediaInMemoryUpload kullanarak 'Resumable' hatasını bypass eder.
     """
     # 1. Eski veriyi temizle
     query = f"name = 'project_db' and '{folder_id}' in parents and trashed = false"
@@ -61,22 +61,21 @@ def save_project_to_drive(service, folder_id, project_data, project_name):
             
     # 2. Veriyi Hazırla (RAM'de Byte Olarak)
     json_str = json.dumps(project_data, ensure_ascii=False, indent=4)
-    # encode() ile string'i byte'a çeviriyoruz
     body_bytes = json_str.encode('utf-8')
     
-    # İŞTE DEĞİŞİKLİK BURADA: MediaInMemoryUpload
-    # chunksize=-1 ve resumable=False ile "Tek Seferde At" diyoruz.
+    # 3. Yükleme Medyası (Tek Seferlik Yükleme - Resumable KAPALI)
     media = MediaInMemoryUpload(body_bytes, 
                                 mimetype='text/plain', 
                                 resumable=False)
     
-    # 3. Google Doc Olarak Yarat (Kota Harcamaz)
+    # 4. Google Doc Olarak Yarat
     file_metadata = {
         'name': 'project_db',
         'mimeType': 'application/vnd.google-apps.document',
         'parents': [folder_id]
     }
     
+    # supportsAllDrives=True parametresi "Shared Drive" mantığını simüle eder
     service.files().create(body=file_metadata, media_body=media, supportsAllDrives=True).execute()
 
 def load_project_from_drive(service, folder_id):
