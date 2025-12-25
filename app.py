@@ -27,12 +27,12 @@ def get_drive_service():
     return build('drive', 'v3', credentials=creds)
 
 def get_nobel_folder_id(service):
-    """NOBEL_CEVIRI_PROJELERI klasörünün ID'sini bulur, yoksa uyarır."""
+    """-CEVIRI PROJELERI klasörünün ID'sini bulur, yoksa uyarır."""
     query = "name = '-CEVIRI PROJELERI' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     results = service.files().list(q=query, fields="files(id, name)").execute()
     items = results.get('files', [])
     if not items:
-        st.error("❌ Google Drive'da 'NOBEL_CEVIRI_PROJELERI' klasörü bulunamadı! Lütfen oluşturun ve bot mailiyle paylaşın.")
+        st.error("❌ Google Drive'da '-CEVIRI PROJELERI' klasörü bulunamadı! Lütfen oluşturun ve bot mailiyle paylaşın.")
         st.stop()
     return items[0]['id']
 
