@@ -7,7 +7,7 @@ from pypdf import PdfReader
 from docx import Document
 
 # --- SAYFA AYARLARI (KEDİ BURADA! 🐱‍💻) ---
-st.set_page_config(page_title="Çeviri", page_icon="🐱‍💻", layout="wide")
+st.set_page_config(page_title="Çevirmen", page_icon="🐱‍💻", layout="wide")
 
 st.title("🐱‍💻 Çeviri İstasyonu")
 st.markdown("PDF, Word ve TXT dosyalarını yükle, proje bazlı çevir.")
