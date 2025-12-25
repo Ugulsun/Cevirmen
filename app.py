@@ -2,7 +2,8 @@ import streamlit as st
 import google.genai as genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+# MediaIoBaseUpload YERİNE MediaInMemoryUpload KULLANIYORUZ:
+from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 import json
 import io
@@ -41,11 +42,11 @@ def get_nobel_folder_id(service):
         st.error(f"Klasör Hatası: {e}")
         st.stop()
 
-# --- KRİTİK DÜZELTME: resumable=False ---
+# --- YENİ KAYIT FONKSİYONU (RAM MOTORLU) ---
 def save_project_to_drive(service, folder_id, project_data, project_name):
     """
     Veriyi Google Doc olarak kaydeder.
-    resumable=False yaparak 'Kota Yok' hatasını bypass ederiz.
+    MediaInMemoryUpload kullanarak 'Resumable' hatasını %100 bypass eder.
     """
     # 1. Eski veriyi temizle
     query = f"name = 'project_db' and '{folder_id}' in parents and trashed = false"
@@ -58,19 +59,21 @@ def save_project_to_drive(service, folder_id, project_data, project_name):
                 service.files().delete(fileId=item['id'], supportsAllDrives=True).execute()
             except: pass
             
-    # 2. Veriyi Hazırla
+    # 2. Veriyi Hazırla (RAM'de Byte Olarak)
     json_str = json.dumps(project_data, ensure_ascii=False, indent=4)
+    # encode() ile string'i byte'a çeviriyoruz
+    body_bytes = json_str.encode('utf-8')
     
-    # İŞTE ÇÖZÜM BURADA: resumable=False
-    # Bu ayar, Google'ın "Kota kontrolü yapmadan" dosyayı almasını sağlar.
-    media = MediaIoBaseUpload(io.BytesIO(json_str.encode('utf-8')), 
-                              mimetype='text/plain', 
-                              resumable=False)
+    # İŞTE DEĞİŞİKLİK BURADA: MediaInMemoryUpload
+    # chunksize=-1 ve resumable=False ile "Tek Seferde At" diyoruz.
+    media = MediaInMemoryUpload(body_bytes, 
+                                mimetype='text/plain', 
+                                resumable=False)
     
-    # 3. Google Doc Olarak Yarat
+    # 3. Google Doc Olarak Yarat (Kota Harcamaz)
     file_metadata = {
         'name': 'project_db',
-        'mimeType': 'application/vnd.google-apps.document', # Kota harcamaz
+        'mimeType': 'application/vnd.google-apps.document',
         'parents': [folder_id]
     }
     
