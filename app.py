@@ -1,10 +1,9 @@
 import streamlit as st
 import google.genai as genai
-from google.oauth2 import service_account
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-# RAM Yöntemi (Kota sorununu çözer)
-from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
-from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 import json
 import io
 import time
@@ -13,112 +12,95 @@ from pypdf import PdfReader
 from docx import Document
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Çeviri", page_icon="🐱‍💻", layout="wide")
+st.set_page_config(page_title="Çeviri (OAuth)", page_icon="🔑", layout="wide")
 
-# --- DRIVE BAĞLANTISI ---
+# --- OAUTH AYARLARI ---
 SCOPES = ['https://www.googleapis.com/auth/drive']
+REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob" 
 
-def get_drive_service():
-    if "GCP_JSON" not in st.secrets:
-        st.error("⚠️ Secrets içinde 'GCP_JSON' bulunamadı.")
+def get_auth_flow():
+    """Secrets'tan bilgileri alıp OAuth akışını başlatır."""
+    if "oauth" not in st.secrets or "CLIENT_CONFIG" not in st.secrets["oauth"]:
+        st.error("⚠️ Secrets içinde [oauth] ve CLIENT_CONFIG bulunamadı.")
         st.stop()
+        
+    client_config = json.loads(st.secrets["oauth"]["CLIENT_CONFIG"])
     
-    creds_info = json.loads(st.secrets["GCP_JSON"])
-    creds = service_account.Credentials.from_service_account_info(
-        creds_info, scopes=SCOPES)
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+    return flow
+
+def authenticate_user():
+    """Kullanıcıyı giriş yapmaya zorlar."""
+    if "creds" in st.session_state:
+        return st.session_state.creds
+
+    st.title("🔑 Google Girişi Gerekli")
+    st.info("Kişisel Drive alanını kullanmak için giriş yapmalısın.")
+    
+    flow = get_auth_flow()
+    auth_url, _ = flow.authorization_url(prompt='consent')
+    
+    st.markdown(f"### 1. Adım: [Buraya Tıkla ve İzin Ver]({auth_url})")
+    st.markdown("Linke tıklayıp izin verdikten sonra Google sana bir kod verecek.")
+    
+    auth_code = st.text_input("### 2. Adım: Kodu buraya yapıştır ve Enter'a bas:")
+    
+    if auth_code:
+        try:
+            flow.fetch_token(code=auth_code)
+            creds = flow.credentials
+            st.session_state.creds = creds
+            st.success("Giriş Başarılı! Bekleyin...")
+            time.sleep(1)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Giriş Hatası: {str(e)}")
+            st.stop()
+    st.stop() 
+
+# --- DRIVE İŞLEMLERİ ---
+def get_drive_service(creds):
     return build('drive', 'v3', credentials=creds)
 
-def get_nobel_folder_id(service):
-    """-CEVIRI PROJELERI klasörünü bulur."""
-    query = "name = '-CEVIRI PROJELERI' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    try:
-        results = service.files().list(q=query, fields="files(id, name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-        items = results.get('files', [])
-        if not items:
-            st.error("❌ Google Drive'da '-CEVIRI PROJELERI' klasörü bulunamadı!")
-            st.stop()
-        return items[0]['id']
-    except HttpError as e:
-        st.error(f"Klasör Hatası: {e}")
-        st.stop()
-
-# --- YENİ KAYIT FONKSİYONU (RAM + SAHİPLİK AYARI) ---
-def save_project_to_drive(service, folder_id, project_data, project_name):
-    """
-    Veriyi Google Doc olarak kaydeder.
-    MediaInMemoryUpload kullanarak 'Resumable' hatasını bypass eder.
-    """
-    # 1. Eski veriyi temizle
-    query = f"name = 'project_db' and '{folder_id}' in parents and trashed = false"
-    results = service.files().list(q=query, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+def get_or_create_folder(service, folder_name):
+    """Senin Drive'ında klasör arar, yoksa yaratır."""
+    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    results = service.files().list(q=query, fields="files(id)").execute()
     items = results.get('files', [])
     
     if items:
-        for item in items:
-            try:
-                service.files().delete(fileId=item['id'], supportsAllDrives=True).execute()
-            except: pass
-            
-    # 2. Veriyi Hazırla (RAM'de Byte Olarak)
-    json_str = json.dumps(project_data, ensure_ascii=False, indent=4)
-    body_bytes = json_str.encode('utf-8')
+        return items[0]['id']
+    else:
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        folder = service.files().create(body=file_metadata, fields='id').execute()
+        return folder.get('id')
+
+def save_project(service, folder_id, project_data, project_name):
+    """Projeyi kaydeder. Kota SENİN kotan olduğu için hata vermez."""
+    file_name = f"{project_name}.json"
     
-    # 3. Yükleme Medyası (Tek Seferlik Yükleme - Resumable KAPALI)
-    media = MediaInMemoryUpload(body_bytes, 
-                                mimetype='text/plain', 
-                                resumable=False)
+    # Eski dosyayı bul
+    query = f"name = '{file_name}' and '{folder_id}' in parents and trashed = false"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    items = results.get('files', [])
     
-    # 4. Google Doc Olarak Yarat
-    file_metadata = {
-        'name': 'project_db',
-        'mimeType': 'application/vnd.google-apps.document',
-        'parents': [folder_id]
-    }
+    json_bytes = json.dumps(project_data, ensure_ascii=False, indent=4).encode('utf-8')
+    media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype='application/json', resumable=True)
     
-    # supportsAllDrives=True parametresi "Shared Drive" mantığını simüle eder
-    service.files().create(body=file_metadata, media_body=media, supportsAllDrives=True).execute()
+    if items:
+        service.files().update(fileId=items[0]['id'], media_body=media).execute()
+    else:
+        file_metadata = {'name': file_name, 'parents': [folder_id]}
+        service.files().create(body=file_metadata, media_body=media).execute()
 
-def load_project_from_drive(service, folder_id):
-    """Google Doc içindeki veriyi okur."""
-    try:
-        query = f"name = 'project_db' and '{folder_id}' in parents and trashed = false"
-        results = service.files().list(q=query, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-        items = results.get('files', [])
-        
-        if not items: return None
-        
-        # Doc'u text olarak indir
-        request = service.files().export_media(fileId=items[0]['id'], mimeType='text/plain')
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while done is False: status, done = downloader.next_chunk()
-        
-        fh.seek(0)
-        return json.load(fh)
-    except Exception as e:
-        st.error(f"Veri Okuma Hatası: {e}")
-        return None
-
-def delete_project_folder(service, folder_id):
-    """Klasörü siler."""
-    try:
-        service.files().delete(fileId=folder_id, supportsAllDrives=True).execute()
-        return True
-    except HttpError as e:
-        st.error(f"Silme Hatası: {e}")
-        return False
-
-def rename_project_folder(service, folder_id, new_name):
-    """Klasör adını değiştirir."""
-    try:
-        service.files().update(fileId=folder_id, body={'name': new_name}, supportsAllDrives=True).execute()
-        return True
-    except HttpError as e:
-        st.error(f"Ad Değiştirme Hatası: {e}")
-        return False
-
-# --- YARDIMCI FONKSİYONLAR ---
+# --- STANDART FONKSİYONLAR ---
 def metni_parcala(metin):
     return [p.strip() for p in metin.split('\n\n') if p.strip()]
 
@@ -142,170 +124,104 @@ def ceviri_yap_gemini(metin, api_key, talimatlar):
         return response.text
     except Exception as e: return f"Hata: {str(e)}"
 
-# --- ARAYÜZ ---
+# --- UYGULAMA BAŞLANGICI ---
+creds = authenticate_user()
+srv = get_drive_service(creds)
+ana_klasor_id = get_or_create_folder(srv, "CEVIRI_PROJELERI_OAUTH")
+
+with st.sidebar:
+    st.write(f"👤 Giriş Yapıldı")
+    if st.button("Çıkış Yap"):
+        del st.session_state.creds
+        st.rerun()
+    st.divider()
+    api_key = st.text_input("Gemini API Key", type="password")
+
 if "aktif_proje" not in st.session_state:
     st.session_state.aktif_proje = None
 
-try:
-    srv = get_drive_service()
-    ana_folder_id = get_nobel_folder_id(srv)
-except Exception as e:
-    st.error(f"Bağlantı Hatası: {e}")
-    st.stop()
-
-with st.sidebar:
-    st.title("⚙️ Ayarlar")
-    api_key = st.text_input("Gemini API Key", type="password")
-    st.divider()
-    if st.button("🚪 Projeleri Listele"):
-        st.session_state.aktif_proje = None
-        st.rerun()
-
-# --- EKRAN 1: PROJE LİSTESİ ---
+# --- EKRAN 1: LİSTE ---
 if st.session_state.aktif_proje is None:
-    st.title("📂 Projelerim")
+    st.title("📂 Projelerim (Kişisel Drive)")
     
-    tabs = st.tabs(["Mevcut Projeler", "Yeni Proje Oluştur"])
+    tabs = st.tabs(["Mevcut Projeler", "Yeni Proje"])
     
     with tabs[0]:
-        results = srv.files().list(q=f"'{ana_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-                                   fields="files(id, name, createdTime)", orderBy="createdTime desc", 
-                                   supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-        projeler = results.get('files', [])
+        q = f"'{ana_klasor_id}' in parents and mimeType = 'application/json' and trashed = false"
+        results = srv.files().list(q=q, fields="files(id, name)").execute()
+        files = results.get('files', [])
         
-        if not projeler:
-            st.info("Henüz proje yok.")
+        if not files: st.info("Henüz proje yok.")
         
-        for p in projeler:
-            with st.container(border=True):
-                col_ad, col_islem = st.columns([5, 1])
-                
-                if col_ad.button(f"📂 {p['name']}", key=f"open_{p['id']}", use_container_width=True):
-                    with st.spinner("Yükleniyor..."):
-                        data = load_project_from_drive(srv, p['id'])
-                        if data:
-                            st.session_state.aktif_proje = data
-                            st.session_state.aktif_folder_id = p['id']
-                            st.rerun()
-                        else:
-                            st.error("Veri dosyası bulunamadı.")
-
-                with col_islem:
-                    with st.popover("⚙️"):
-                        yeni_ad = st.text_input("Yeni Ad", value=p['name'], key=f"ren_txt_{p['id']}")
-                        if st.button("Kaydet", key=f"save_ren_{p['id']}"):
-                            rename_project_folder(srv, p['id'], yeni_ad)
-                            st.success("Ad Değişti!")
-                            time.sleep(1)
-                            st.rerun()
-                        
-                        st.divider()
-                        if st.button("🗑️ Sil", key=f"del_btn_{p['id']}", type="primary"):
-                            delete_project_folder(srv, p['id'])
-                            st.success("Silindi.")
-                            time.sleep(1)
-                            st.rerun()
+        for f in files:
+            col1, col2 = st.columns([4, 1])
+            if col1.button(f"📄 {f['name']}", key=f.get('id')):
+                request = srv.files().get_media(fileId=f['id'])
+                fh = io.BytesIO()
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while done is False: _, done = downloader.next_chunk()
+                fh.seek(0)
+                st.session_state.aktif_proje = json.load(fh)
+                st.session_state.aktif_dosya_id = f['id']
+                st.rerun()
+            
+            if col2.button("🗑️", key=f"del_{f['id']}"):
+                srv.files().delete(fileId=f['id']).execute()
+                st.success("Silindi")
+                time.sleep(1)
+                st.rerun()
 
     with tabs[1]:
         st.subheader("Yeni Proje")
-        proje_adi = st.text_input("Proje Adı")
-        dosya_orj = st.file_uploader("1. Orijinal Metin", type=['txt', 'docx', 'pdf'])
-        dosya_cev = st.file_uploader("2. Yarım Çeviri (Opsiyonel)", type=['txt', 'docx', 'pdf'])
+        ad = st.text_input("Proje Adı")
+        dosya = st.file_uploader("Metin Dosyası", type=['txt', 'docx', 'pdf'])
         
-        if st.button("Projeyi Oluştur") and proje_adi and dosya_orj:
-            with st.spinner("Oluşturuluyor..."):
-                def read_file(f):
-                    if f.name.endswith('.pdf'): r = PdfReader(f); return "".join([p.extract_text() for p in r.pages])
-                    elif f.name.endswith('.docx'): d = Document(f); return "\n\n".join([p.text for p in d.paragraphs])
-                    else: return f.read().decode('utf-8')
-                
-                txt_orj = read_file(dosya_orj)
-                txt_cev = read_file(dosya_cev) if dosya_cev else ""
-                
-                project_data = {
-                    "meta": {"ad": proje_adi, "tarih": str(datetime.now())},
-                    "paragraflar": paragraf_eslestir(metni_parcala(txt_orj), metni_parcala(txt_cev))
-                }
-                
-                folder_meta = {
-                    'name': proje_adi,
-                    'mimeType': 'application/vnd.google-apps.folder',
-                    'parents': [ana_folder_id]
-                }
-                folder = srv.files().create(body=folder_meta, fields='id', supportsAllDrives=True).execute()
-                yeni_id = folder.get('id')
-                
-                save_project_to_drive(srv, yeni_id, project_data, proje_adi)
-                
-                st.success("Oluşturuldu!")
-                time.sleep(1)
-                st.session_state.aktif_proje = project_data
-                st.session_state.aktif_folder_id = yeni_id
-                st.rerun()
+        if st.button("Oluştur") and ad and dosya:
+            if dosya.name.endswith('.pdf'): txt = "".join([p.extract_text() for p in PdfReader(dosya).pages])
+            elif dosya.name.endswith('.docx'): txt = "\n\n".join([p.text for p in Document(dosya).paragraphs])
+            else: txt = dosya.read().decode('utf-8')
+            
+            data = {
+                "meta": {"ad": ad, "tarih": str(datetime.now())},
+                "paragraflar": paragraf_eslestir(metni_parcala(txt), [])
+            }
+            
+            save_project(srv, ana_klasor_id, data, ad)
+            st.success("Proje oluşturuldu!")
+            time.sleep(1)
+            st.rerun()
 
 # --- EKRAN 2: EDİTÖR ---
 else:
     proje = st.session_state.aktif_proje
-    folder_id = st.session_state.aktif_folder_id
+    st.header(f"📝 {proje['meta']['ad']}")
+    
+    if st.button("🔙 Listeye Dön"):
+        st.session_state.aktif_proje = None
+        st.rerun()
+        
     paragraflar = proje["paragraflar"]
+    if "cursor" not in st.session_state: st.session_state.cursor = 0
     
-    st.markdown(f"## 📝 {proje['meta']['ad']}")
+    col_nav1, col_nav2 = st.columns(2)
+    if col_nav1.button("⬅️"): st.session_state.cursor = max(0, st.session_state.cursor - 1)
+    if col_nav2.button("➡️"): st.session_state.cursor = min(len(paragraflar)-1, st.session_state.cursor + 1)
     
-    toplam = len(paragraflar)
-    biten = len([p for p in paragraflar if p['durum'] == 'onaylandi'])
-    st.progress(biten/toplam, text=f"Durum: {biten}/{toplam}")
-    
-    if "cursor" not in st.session_state:
-        st.session_state.cursor = next((i for i, p in enumerate(paragraflar) if p['durum'] == 'bekliyor'), 0)
-
-    c1, c2, c3, c4 = st.columns([1, 1, 3, 1])
-    if c1.button("⬅️ Geri"): st.session_state.cursor = max(0, st.session_state.cursor - 1)
-    if c2.button("İleri ➡️"): st.session_state.cursor = min(toplam - 1, st.session_state.cursor + 1)
-    
-    hedef = c3.number_input("Git", 1, toplam, st.session_state.cursor + 1, label_visibility="collapsed") - 1
-    if hedef != st.session_state.cursor:
-        st.session_state.cursor = hedef
-        st.rerun()
-        
-    if c4.button("⏭️ Boşa Git"):
-        st.session_state.cursor = next((i for i, p in enumerate(paragraflar) if p['durum'] == 'bekliyor'), st.session_state.cursor)
-        st.rerun()
-
     idx = st.session_state.cursor
-    current_p = paragraflar[idx]
+    p = paragraflar[idx]
     
-    st.divider()
-    col_sol, col_sag = st.columns(2)
+    col1, col2 = st.columns(2)
+    col1.info(p['orjinal'])
     
-    with col_sol:
-        st.caption(f"Orijinal ({idx+1})")
-        st.info(current_p['orjinal'])
+    if not p['ceviri'] and api_key and st.button("🤖 Çevir"):
+        with st.spinner("Çevriliyor..."):
+            p['ceviri'] = ceviri_yap_gemini(p['orjinal'], api_key, "Sen profesyonel çevirmensin.")
+            
+    yeni_ceviri = col2.text_area("Çeviri", p['ceviri'], height=200)
     
-    with col_sag:
-        st.caption("Çeviri")
-        if not current_p['ceviri'] and api_key:
-            with st.spinner("🤖 Çevriliyor..."):
-                current_p['ceviri'] = ceviri_yap_gemini(current_p['orjinal'], api_key, "Sen profesyonel çevirmensin.")
-        
-        yeni_metin = st.text_area("Editör", value=current_p['ceviri'], height=200, label_visibility="collapsed")
-        
-        if st.button("✅ Onayla", type="primary", use_container_width=True):
-            current_p['ceviri'] = yeni_metin
-            current_p['durum'] = 'onaylandi'
-            
-            save_project_to_drive(srv, folder_id, proje, proje['meta']['ad'])
-            
-            if idx < toplam - 1: st.session_state.cursor += 1
-            st.toast("Kaydedildi!")
-            st.rerun()
-            
-    st.divider()
-    if st.button("📥 Word İndir"):
-        doc = Document()
-        doc.add_heading(proje['meta']['ad'], 0)
-        for p in paragraflar:
-            if p['durum'] == 'onaylandi': doc.add_paragraph(p['ceviri'])
-            else: doc.add_paragraph("--- ÇEVRİLMEDİ ---")
-        bio = io.BytesIO()
-        doc.save(bio)
-        st.download_button("Dosyayı İndir", bio.getvalue(), f"{proje['meta']['ad']}.docx")
+    if col2.button("✅ Kaydet", type="primary"):
+        p['ceviri'] = yeni_ceviri
+        p['durum'] = "onaylandi"
+        save_project(srv, ana_klasor_id, proje, proje['meta']['ad'])
+        st.toast("Kaydedildi!")
