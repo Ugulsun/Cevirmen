@@ -1,219 +1,301 @@
 import streamlit as st
-import sqlite3
 import google.genai as genai
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+import json
+import io
+import time
+from datetime import datetime
 from pypdf import PdfReader
 from docx import Document
-import time
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Çeviri", page_icon="🐱‍💻", layout="wide")
 
-# --- GÜVENLİK KONTROLÜ (FEDAI) 🔒 ---
-def sifre_kontrol():
-    """Doğru şifre girilmeden içeri almaz."""
+# --- DRIVE BAĞLANTISI ---
+SCOPES = ['https://www.googleapis.com/auth/drive']
+
+def get_drive_service():
+    if "GCP_JSON" not in st.secrets:
+        st.error("⚠️ Secrets içinde 'GCP_JSON' bulunamadı. Lütfen Service Account JSON içeriğini ekleyin.")
+        st.stop()
     
-    # Eğer Secrets'ta şifre tanımlı değilse herkesi içeri al (Geliştirme modu)
-    if "UYGULAMA_SIFRESI" not in st.secrets:
-        st.warning("⚠️ UYARI: Secrets içinde 'UYGULAMA_SIFRESI' tanımlanmamış. Uygulama herkese açık!")
-        return True
+    creds_info = json.loads(st.secrets["GCP_JSON"])
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info, scopes=SCOPES)
+    return build('drive', 'v3', credentials=creds)
 
-    if "giris_yapildi" not in st.session_state:
-        st.session_state["giris_yapildi"] = False
+def get_nobel_folder_id(service):
+    """NOBEL_CEVIRI_PROJELERI klasörünün ID'sini bulur, yoksa uyarır."""
+    query = "name = 'NOBEL_CEVIRI_PROJELERI' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    items = results.get('files', [])
+    if not items:
+        st.error("❌ Google Drive'da 'NOBEL_CEVIRI_PROJELERI' klasörü bulunamadı! Lütfen oluşturun ve bot mailiyle paylaşın.")
+        st.stop()
+    return items[0]['id']
 
-    if not st.session_state["giris_yapildi"]:
-        st.title("🔒 Giriş Yap")
-        sifre = st.text_input("Şifre", type="password")
-        if st.button("Giriş"):
-            if sifre == st.secrets["UYGULAMA_SIFRESI"]:
-                st.session_state["giris_yapildi"] = True
-                st.rerun() # Sayfayı yenile ve içeri al
-            else:
-                st.error("Yanlış şifre!")
-        return False
-    return True
+def save_project_to_drive(service, folder_id, project_data, project_name):
+    """Proje verilerini JSON olarak Drive'a kaydeder."""
+    file_metadata = {
+        'name': 'project_data.json',
+        'mimeType': 'application/json',
+        'parents': [folder_id]
+    }
+    
+    # Mevcut dosyayı bul ve güncelle (yoksa yarat)
+    query = f"name = 'project_data.json' and '{folder_id}' in parents and trashed = false"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    items = results.get('files', [])
+    
+    # Veriyi hazırla
+    media = MediaIoBaseUpload(io.BytesIO(json.dumps(project_data, ensure_ascii=False, indent=4).encode('utf-8')),
+                              mimetype='application/json', resumable=True)
+    
+    if items:
+        # Güncelle
+        file_id = items[0]['id']
+        service.files().update(fileId=file_id, media_body=media).execute()
+    else:
+        # Yarat
+        service.files().create(body=file_metadata, media_body=media).execute()
 
-# Eğer şifre kontrolü geçilmezse kodun geri kalanını çalıştırma
-if not sifre_kontrol():
-    st.stop()
+def load_project_from_drive(service, folder_id):
+    """Drive'dan proje verisini çeker."""
+    query = f"name = 'project_data.json' and '{folder_id}' in parents and trashed = false"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    items = results.get('files', [])
+    
+    if not items:
+        return None
+    
+    file_id = items[0]['id']
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while done is False:
+        status, done = downloader.next_chunk()
+    
+    fh.seek(0)
+    return json.load(fh)
 
-# ==========================================
-# BURADAN AŞAĞISI NORMAL UYGULAMA KODLARIN
-# ==========================================
+def yedekle_eski_dosya(service, folder_id, project_name):
+    """Günü değişmişse eski dosyayı ESKİ klasörüne atar."""
+    # Bu özellik karmaşıklığı artırmamak için şimdilik basit tutuldu:
+    # Her kayıtta üzerine yazar. İstenirse tarihli kopya oluşturulabilir.
+    pass
 
-# --- VERİTABANI BAĞLANTISI ---
-def init_db():
-    conn = sqlite3.connect('ceviri_bellek.db', check_same_thread=False)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS projeler
-                 (id INTEGER PRIMARY KEY, ad TEXT, olusturma_tarihi TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS paragraflar
-                 (id INTEGER PRIMARY KEY, proje_id INTEGER, 
-                  sira INTEGER, orjinal_metin TEXT, ceviri_metin TEXT, 
-                  durum TEXT DEFAULT 'bekliyor')''')
-    conn.commit()
-    return conn
-
-conn = init_db()
-
-# --- YARDIMCI FONKSİYONLAR ---
-def get_api_key(provider):
-    if provider == "Gemini":
-        if "GOOGLE_API_KEY" in st.secrets:
-            return st.secrets["GOOGLE_API_KEY"]
-        return st.session_state.get("gemini_key", "")
-    elif provider == "OpenAI":
-        if "OPENAI_API_KEY" in st.secrets:
-            return st.secrets["OPENAI_API_KEY"]
-        return st.session_state.get("openai_key", "")
-    return ""
-
+# --- YARDIMCI METİN İŞLEMLERİ ---
 def metni_parcala(metin):
     return [p.strip() for p in metin.split('\n\n') if p.strip()]
 
-def ceviri_yap(metin, model_adi, talimatlar):
-    api_key = get_api_key("Gemini")
-    if not api_key:
-        return "⚠️ API Anahtarı Eksik"
+def paragraf_eslestir(orjinal_liste, ceviri_liste):
+    """Yarım çeviri ile orijinali eşleştirir."""
+    data = []
+    len_ceviri = len(ceviri_liste)
+    for i, orj in enumerate(orjinal_liste):
+        durum = "bekliyor"
+        ceviri = ""
+        # Basit mantık: Sıra numarası tutuyorsa eşleştir.
+        # (Gelişmiş versiyonda benzerlik analizi yapılabilir)
+        if i < len_ceviri:
+            ceviri = ceviri_liste[i]
+            durum = "onaylandi" # Zaten çevrilmiş dosya olduğu için onaylı sayıyoruz
+        
+        data.append({
+            "id": i,
+            "orjinal": orj,
+            "ceviri": ceviri,
+            "durum": durum
+        })
+    return data
+
+def ceviri_yap_gemini(metin, api_key, talimatlar):
     try:
         client = genai.Client(api_key=api_key)
         prompt = f"""{talimatlar}
+        Yorum yapma, sadece çeviriyi ver.
         METİN: {metin}
         """
-        response = client.models.generate_content(model=model_adi, contents=prompt)
+        response = client.models.generate_content(model="gemini-2.5-pro", contents=prompt)
         return response.text
     except Exception as e:
         return f"Hata: {str(e)}"
 
-# --- ARAYÜZ BAŞLANGICI ---
+# --- ARAYÜZ ---
+if "aktif_proje" not in st.session_state:
+    st.session_state.aktif_proje = None
+
+# Drive Servisini Başlat
+try:
+    srv = get_drive_service()
+    ana_folder_id = get_nobel_folder_id(srv)
+except Exception as e:
+    st.error(f"Bağlantı Hatası: {e}")
+    st.stop()
 
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/616/616430.png", width=50)
-    st.title("Ayarlar")
+    st.title("⚙️ Ayarlar")
+    api_key = st.text_input("Gemini API Key", type="password")
     
-    # Çıkış Butonu
-    if st.button("🔒 Çıkış Yap"):
-        st.session_state["giris_yapildi"] = False
-        st.rerun()
-        
     st.divider()
-    
-    secilen_llm = st.selectbox("Aktif Model", ["Gemini 2.5 Pro", "Gemini 2.5 Flash"])
-    
-    with st.expander("API Anahtarları (Manuel)"):
-        st.info("Secrets ayarlıysa boş bırakın.")
-        st.text_input("Gemini API Key", key="gemini_key", type="password")
+    if st.button("Çıkış / Proje Kapat"):
+        st.session_state.aktif_proje = None
+        st.rerun()
 
-    varsayilan_talimat = st.text_area("Çevirmen Kimliği", 
-        value="Sen profesyonel bir kitap çevirmenisin. Edebi, akıcı ve anlam odaklı çevir.", height=100)
-
-if 'aktif_proje_id' not in st.session_state:
-    st.session_state.aktif_proje_id = None
-
-# EKRAN A: PROJE LİSTESİ
-if st.session_state.aktif_proje_id is None:
-    st.title("🐱‍💻 Proje Yönetimi")
+# --- EKRAN 1: PROJE LİSTESİ ---
+if st.session_state.aktif_proje is None:
+    st.title("📂 Projeler (Drive)")
     
-    col1, col2 = st.columns([2, 1])
+    tabs = st.tabs(["Mevcut Projeler", "Yeni Proje Oluştur"])
     
-    with col1:
-        st.subheader("Mevcut Projeler")
-        c = conn.cursor()
-        projeler = c.execute("SELECT * FROM projeler ORDER BY id DESC").fetchall()
+    with tabs[0]:
+        # Drive'daki proje klasörlerini listele
+        q = f"'{ana_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        results = srv.files().list(q=q, fields="files(id, name)").execute()
+        projeler = results.get('files', [])
         
         if not projeler:
-            st.info("Henüz proje yok.")
+            st.info("Drive'da hiç proje klasörü yok.")
         
         for p in projeler:
-            p_id, p_ad, p_tarih = p
-            toplam = c.execute("SELECT COUNT(*) FROM paragraflar WHERE proje_id=?", (p_id,)).fetchone()[0]
-            biten = c.execute("SELECT COUNT(*) FROM paragraflar WHERE durum='onaylandi' AND proje_id=?", (p_id,)).fetchone()[0]
-            yuzde = int((biten/toplam)*100) if toplam > 0 else 0
-            
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([3, 2, 1])
-                c1.markdown(f"**{p_ad}**")
-                c2.progress(yuzde/100, text=f"%{yuzde}")
-                if c3.button("Aç", key=f"btn_{p_id}"):
-                    st.session_state.aktif_proje_id = p_id
+            col1, col2 = st.columns([3, 1])
+            col1.subheader(f"📁 {p['name']}")
+            if col2.button("Projeyi Aç", key=p['id']):
+                # Projeyi Yükle
+                data = load_project_from_drive(srv, p['id'])
+                if data:
+                    st.session_state.aktif_proje = data
+                    st.session_state.aktif_folder_id = p['id']
                     st.rerun()
+                else:
+                    st.error("Proje verisi okunamadı.")
 
-    with col2:
-        st.subheader("Yeni Proje")
-        yeni_ad = st.text_input("Proje Adı")
-        dosya = st.file_uploader("Dosya Yükle")
+    with tabs[1]:
+        st.subheader("Yeni Proje Başlat")
+        proje_adi = st.text_input("Proje Adı (Klasör Adı)")
+        dosya_orj = st.file_uploader("1. Orijinal Dosya (Zorunlu)", type=['txt', 'docx', 'pdf'])
+        dosya_cev = st.file_uploader("2. Yarım Çeviri (Varsa)", type=['txt', 'docx', 'pdf'], help="Elinizdeki yarım çeviriyi yükleyin, sistem kaldığınız yeri anlar.")
         
-        if st.button("Oluştur") and yeni_ad and dosya:
-            metin = ""
-            if dosya.name.endswith(".pdf"):
-                reader = PdfReader(dosya)
-                for page in reader.pages: metin += page.extract_text() + "\n"
-            elif dosya.name.endswith(".docx"):
-                doc = Document(dosya)
-                for para in doc.paragraphs: metin += para.text + "\n"
-            else:
-                metin = dosya.read().decode("utf-8")
-            
-            cur = conn.cursor()
-            cur.execute("INSERT INTO projeler (ad, olusturma_tarihi) VALUES (?, ?)", (yeni_ad, str(time.time())))
-            yeni_id = cur.lastrowid
-            
-            paragraflar = metni_parcala(metin)
-            for i, p in enumerate(paragraflar):
-                cur.execute("INSERT INTO paragraflar (proje_id, sira, orjinal_metin) VALUES (?, ?, ?)", 
-                            (yeni_id, i, p))
-            conn.commit()
-            st.success("Oluşturuldu!")
-            st.rerun()
+        if st.button("Oluştur") and proje_adi and dosya_orj:
+            with st.spinner("Drive klasörü oluşturuluyor ve analiz ediliyor..."):
+                # 1. Metinleri Oku
+                def read_file(f):
+                    if f.name.endswith('.pdf'):
+                        r = PdfReader(f); return "".join([p.extract_text() for p in r.pages])
+                    elif f.name.endswith('.docx'):
+                        d = Document(f); return "\n\n".join([p.text for p in d.paragraphs])
+                    else: return f.read().decode('utf-8')
+                
+                txt_orj = read_file(dosya_orj)
+                txt_cev = read_file(dosya_cev) if dosya_cev else ""
+                
+                # 2. Parçala ve Eşleştir
+                list_orj = metni_parcala(txt_orj)
+                list_cev = metni_parcala(txt_cev)
+                
+                project_data = {
+                    "meta": {"ad": proje_adi, "tarih": str(datetime.now())},
+                    "paragraflar": paragraf_eslestir(list_orj, list_cev)
+                }
+                
+                # 3. Drive Klasörü Yarat
+                folder_meta = {
+                    'name': proje_adi,
+                    'mimeType': 'application/vnd.google-apps.folder',
+                    'parents': [ana_folder_id]
+                }
+                folder = srv.files().create(body=folder_meta, fields='id').execute()
+                new_folder_id = folder.get('id')
+                
+                # 4. Veriyi Kaydet
+                save_project_to_drive(srv, new_folder_id, project_data, proje_adi)
+                
+                st.success(f"Proje oluşturuldu! {len(list_cev)} paragraf hazır eşleştirildi.")
 
-# EKRAN B: EDİTÖR
+# --- EKRAN 2: ÇEVİRİ EDİTÖRÜ ---
 else:
-    cur = conn.cursor()
-    proje = cur.execute("SELECT * FROM projeler WHERE id=?", (st.session_state.aktif_proje_id,)).fetchone()
+    proje = st.session_state.aktif_proje
+    folder_id = st.session_state.aktif_folder_id
+    paragraflar = proje["paragraflar"]
     
-    if st.button("⬅️ Projelere Dön"):
-        st.session_state.aktif_proje_id = None
+    st.header(f"📝 {proje['meta']['ad']}")
+    
+    # İstatistik
+    toplam = len(paragraflar)
+    biten = len([p for p in paragraflar if p['durum'] == 'onaylandi'])
+    st.progress(biten/toplam, text=f"İlerleme: {biten}/{toplam}")
+    
+    # Navigasyon
+    if "cursor" not in st.session_state:
+        # İlk 'bekliyor' olanı bul
+        first_waiting = next((i for i, p in enumerate(paragraflar) if p['durum'] == 'bekliyor'), 0)
+        st.session_state.cursor = first_waiting
+
+    col_nav1, col_nav2, col_nav3, col_nav4 = st.columns([1, 1, 2, 1])
+    if col_nav1.button("⬅️ Önceki"): st.session_state.cursor = max(0, st.session_state.cursor - 1)
+    if col_nav2.button("Sonraki ➡️"): st.session_state.cursor = min(toplam - 1, st.session_state.cursor + 1)
+    
+    # Gitmek istenen paragraf
+    yeni_cursor = col_nav3.number_input("Paragraf No Git", min_value=1, max_value=toplam, value=st.session_state.cursor + 1) - 1
+    if yeni_cursor != st.session_state.cursor:
+        st.session_state.cursor = yeni_cursor
         st.rerun()
 
-    st.markdown(f"## 📂 {proje[1]}")
+    if col_nav4.button("⏭️ İlk Boşa Git"):
+        next_waiting = next((i for i, p in enumerate(paragraflar) if p['durum'] == 'bekliyor'), st.session_state.cursor)
+        st.session_state.cursor = next_waiting
+        st.rerun()
+
+    # --- EDİTÖR ---
+    idx = st.session_state.cursor
+    current_p = paragraflar[idx]
+    
     st.divider()
+    st.markdown(f"### Paragraf {idx + 1}")
     
-    kalinan_yer = cur.execute("""
-        SELECT * FROM paragraflar 
-        WHERE proje_id=? AND durum='bekliyor' 
-        ORDER BY sira ASC LIMIT 1
-    """, (proje[0],)).fetchone()
+    col_sol, col_sag = st.columns(2)
     
-    if not kalinan_yer:
-        st.balloons()
-        st.success("Proje bitti!")
-    else:
-        aktif_id, pid, sira, orjinal, ceviri, durum = kalinan_yer
+    with col_sol:
+        st.info(current_p['orjinal'])
+    
+    with col_sag:
+        # Çeviri yoksa otomatik yap
+        if not current_p['ceviri'] and api_key:
+            with st.spinner("Çevriliyor..."):
+                oto_ceviri = ceviri_yap_gemini(current_p['orjinal'], api_key, "Sen profesyonel çevirmensin.")
+                current_p['ceviri'] = oto_ceviri # Geçici kaydet
         
-        # Pre-fetch
-        hedef_paragraflar = cur.execute("""
-            SELECT * FROM paragraflar 
-            WHERE proje_id=? AND sira >= ? 
-            ORDER BY sira ASC LIMIT 3
-        """, (pid, sira)).fetchall()
+        yeni_metin = st.text_area("Çeviri", value=current_p['ceviri'], height=200)
         
-        with st.spinner("Analiz..."):
-            for p_row in hedef_paragraflar:
-                p_id_temp, _, _, p_orj, p_cev, _ = p_row
-                if not p_cev:
-                    yeni_ceviri = ceviri_yap(p_orj, "gemini-2.5-pro", varsayilan_talimat)
-                    cur.execute("UPDATE paragraflar SET ceviri_metin=? WHERE id=?", (yeni_ceviri, p_id_temp))
-                    conn.commit()
+        if st.button("✅ Onayla ve Kaydet", type="primary"):
+            # Güncelle
+            current_p['ceviri'] = yeni_metin
+            current_p['durum'] = 'onaylandi'
+            
+            # Drive'a Kaydet (Kalıcılık!)
+            save_project_to_drive(srv, folder_id, proje, proje['meta']['ad'])
+            
+            # Sonrakine geç
+            if idx < toplam - 1:
+                st.session_state.cursor += 1
+            st.toast("Kaydedildi!")
+            st.rerun()
+
+    # --- İNDİRME SEÇENEKLERİ ---
+    st.divider()
+    st.subheader("📤 Dışa Aktar")
+    if st.button("Word Olarak İndir"):
+        doc = Document()
+        doc.add_heading(proje['meta']['ad'], 0)
+        for p in paragraflar:
+            if p['durum'] == 'onaylandi':
+                doc.add_paragraph(p['ceviri'])
+            else:
+                doc.add_paragraph(f"--- [Çevrilmedi: {p['orjinal'][:20]}...] ---")
         
-        aktif_paragraf = cur.execute("SELECT * FROM paragraflar WHERE id=?", (aktif_id,)).fetchone()
-        _, _, _, guncel_orjinal, guncel_ceviri, _ = aktif_paragraf
-        
-        col_sol, col_sag = st.columns(2)
-        with col_sol:
-            st.info(guncel_orjinal)
-        with col_sag:
-            duzeltilmis = st.text_area("Çeviri:", value=guncel_ceviri, height=200)
-            if st.button("✅ Onayla", type="primary"):
-                cur.execute("UPDATE paragraflar SET ceviri_metin=?, durum='onaylandi' WHERE id=?", 
-                            (duzeltilmis, aktif_id))
-                conn.commit()
-                st.rerun()
+        bio = io.BytesIO()
+        doc.save(bio)
+        st.download_button("Dosyayı İndir", bio.getvalue(), file_name=f"{proje['meta']['ad']}_Ceviri.docx")
