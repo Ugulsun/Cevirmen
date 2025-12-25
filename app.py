@@ -1,196 +1,236 @@
 import streamlit as st
+import sqlite3
 import google.genai as genai
-import json
-import io
-import zipfile
+# import openai  # OpenAI entegrasyonu için ilerde aktif edilebilir
 from pypdf import PdfReader
 from docx import Document
+import time
 
-# --- SAYFA AYARLARI (KEDİ BURADA! 🐱‍💻) ---
-st.set_page_config(page_title="Çevirmen", page_icon="🐱‍💻", layout="wide")
+# --- SAYFA AYARLARI ---
+st.set_page_config(page_title="Çeviri", page_icon="🐱‍💻", layout="wide")
 
-st.title("🐱‍💻 Çeviri İstasyonu")
-st.markdown("PDF, Word ve TXT dosyalarını yükle, proje bazlı çevir.")
+# --- VERİTABANI BAĞLANTISI (SQLite) ---
+def init_db():
+    conn = sqlite3.connect('ceviri_bellek.db', check_same_thread=False)
+    c = conn.cursor()
+    # Projeler Tablosu
+    c.execute('''CREATE TABLE IF NOT EXISTS projeler
+                 (id INTEGER PRIMARY KEY, ad TEXT, olusturma_tarihi TEXT)''')
+    # Paragraflar Tablosu (Her paragrafın durumu burada tutulur)
+    c.execute('''CREATE TABLE IF NOT EXISTS paragraflar
+                 (id INTEGER PRIMARY KEY, proje_id INTEGER, 
+                  sira INTEGER, orjinal_metin TEXT, ceviri_metin TEXT, 
+                  durum TEXT DEFAULT 'bekliyor')''') # durum: bekliyor, onaylandi
+    conn.commit()
+    return conn
 
-# --- YAN MENÜ (AYARLAR & HAFIZA) ---
-with st.sidebar:
-    st.header("⚙️ Ayarlar")
-    
-    # API Key
-    api_key = st.text_input("Google API Key", type="password", help="Anahtarın burada güvende.")
-    
-    st.divider()
-    
-    # 1. PROJE İSMİ
-    proje_adi = st.text_input("📁 Proje Adı", value="Yeni_Proje")
-    
-    st.divider()
+conn = init_db()
 
-    # 2. HAFIZA YÖNETİMİ
-    st.subheader("🧠 Proje Hafızası")
-    st.info("Bu projenin öğrendiği kuralları (.json) buradan yükle.")
-    
-    uploaded_hafiza = st.file_uploader("Hafıza Dosyası Seç", type=["json"], key="hafiza_upload")
-    
-    hafiza = []
-    if uploaded_hafiza:
-        try:
-            hafiza = json.load(uploaded_hafiza)
-            st.success(f"✅ {len(hafiza)} kural yüklendi!")
-        except:
-            st.error("Dosya okunamadı.")
-    else:
-        st.caption("Henüz hafıza yüklenmedi, varsayılan kurallar geçerli.")
+# --- YARDIMCI FONKSİYONLAR ---
 
-    # 3. TALİMATLAR
-    st.subheader("📜 Talimatlar")
-    varsayilan_talimat = """Sen profesyonel bir kitap çevirmenisin.
-    - Anlam ve duygu odaklı çevir.
-    - İngilizce tırnakları Türkçe (" ") yap.
-    - 'Kelime' yerine 'Sözcük' kullan.
-    - Akıcı, edebi ve modern Türkçe kullan."""
-    sistem_talimati = st.text_area("Çeviri Kuralları", value=varsayilan_talimat, height=150)
+def get_api_key(provider):
+    # Önce Secrets'a bakar, yoksa Session State'e bakar
+    if provider == "Gemini":
+        if "GOOGLE_API_KEY" in st.secrets:
+            return st.secrets["GOOGLE_API_KEY"]
+        return st.session_state.get("gemini_key", "")
+    elif provider == "OpenAI":
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+        return st.session_state.get("openai_key", "")
+    return ""
 
-# --- FONKSİYONLAR ---
+def metni_parcala(metin):
+    # Basitçe boş satırlara göre böler, daha zeki bölme eklenebilir
+    return [p.strip() for p in metin.split('\n\n') if p.strip()]
 
-def dosya_oku(uploaded_file):
-    """Dosya tipine göre okuma yapar."""
-    text = ""
-    try:
-        if uploaded_file.name.endswith(".pdf"):
-            reader = PdfReader(uploaded_file)
-            for page in reader.pages:
-                text += page.extract_text() + "\n"
-        elif uploaded_file.name.endswith(".docx"):
-            doc = Document(uploaded_file)
-            for para in doc.paragraphs:
-                text += para.text + "\n"
-        else: # .txt varsayalım
-            text = uploaded_file.read().decode("utf-8")
-    except Exception as e:
-        return f"HATA: Dosya okunamadı. {e}"
-    return text
-
-def ceviriyi_yap(metin, kurallar, hafiza_listesi, api_key):
+def ceviri_yap(metin, model_adi, talimatlar):
+    api_key = get_api_key("Gemini") # Şimdilik varsayılan Gemini
     if not api_key:
-        return "Lütfen API Key girin."
-    
-    client = genai.Client(api_key=api_key)
-    
-    # Hafızayı prompta ekle
-    hafiza_metni = ""
-    if hafiza_listesi:
-        hafiza_metni = "\nBUNLARI UNUTMA (ÖĞRENDİĞİN KURALLAR):\n" + "\n".join([f"- {k['kural']}" for k in hafiza_listesi])
-    
-    prompt = f"""{kurallar}
-    {hafiza_metni}
-    
-    GÖREV: Aşağıdaki metni Türkçeye çevir. Formatı koru.
-    
-    METİN:
-    {metin}
-    """
+        return "⚠️ API Anahtarı Eksik"
     
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-pro",
-            contents=prompt
-        )
+        client = genai.Client(api_key=api_key)
+        prompt = f"""{talimatlar}
+        
+        METİN: {metin}
+        """
+        response = client.models.generate_content(model=model_adi, contents=prompt)
         return response.text
     except Exception as e:
-        return f"API Hatası: {e}"
+        return f"Hata: {str(e)}"
 
-def ders_cikar(ham_metin, duzeltilmis_metin, api_key):
-    client = genai.Client(api_key=api_key)
-    prompt = f"""
-    Ham Çeviri: "{ham_metin}"
-    İnsan Düzeltmesi: "{duzeltilmis_metin}"
-    
-    Farkları analiz et ve çevirmenin stiline dair GENEL BİR KURAL çıkar.
-    Sadece JSON formatında ver: {{"kural": "..."}}
-    """
-    response = client.models.generate_content(
-        model="gemini-2.5-pro",
-        contents=prompt,
-        config={'response_mime_type': 'application/json'}
-    )
-    return json.loads(response.text)
+# --- ARAYÜZ ---
 
-# --- ANA EKRAN SEKMELERİ ---
-tab1, tab2 = st.tabs(["📂 Çeviri", "🎓 Öğren"])
+# 1. YAN MENÜ (AYARLAR)
+with st.sidebar:
+    st.image("https://cdn-icons-png.flaticon.com/512/616/616430.png", width=50) # Kedi ikonu temsili
+    st.title("Ayarlar")
+    
+    secilen_llm = st.selectbox("Aktif Model", ["Gemini 2.5 Pro", "Gemini 2.5 Flash", "GPT-4o (Yakında)"])
+    
+    with st.expander("API Anahtarları (Manuel)"):
+        st.info("Eğer 'Secrets' ayarlıysa burası boş kalabilir.")
+        st.text_input("Gemini API Key", key="gemini_key", type="password")
+        st.text_input("OpenAI API Key", key="openai_key", type="password")
 
-# --- 1. SEKME: ÇEVİRİ ---
-with tab1:
-    st.subheader(f"Proje: {proje_adi}")
-    
-    uploaded_files = st.file_uploader("Dosyaları Buraya Bırak (PDF, DOCX, TXT)", accept_multiple_files=True)
-    
-    if uploaded_files and st.button("🚀 Çevir"):
-        if not api_key:
-            st.error("Lütfen soldan API Key girin.")
-        else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            sonuclar = {}
-            
-            for i, dosya in enumerate(uploaded_files):
-                status_text.text(f"Çevriliyor: {dosya.name}...")
-                ham_icerik = dosya_oku(dosya)
-                # Not: Çok uzun metinlerde parçalama yapmak gerekebilir.
-                ceviri_sonucu = ceviriyi_yap(ham_icerik, sistem_talimati, hafiza, api_key)
-                
-                yeni_isim = f"TR_{dosya.name.split('.')[0]}.txt"
-                sonuclar[yeni_isim] = ceviri_sonucu
-                progress_bar.progress((i + 1) / len(uploaded_files))
-            
-            status_text.success("✅ Tamamlandı!")
-            
-            # ZIP İndirme
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w") as zf:
-                for isim, icerik in sonuclar.items():
-                    zf.writestr(isim, icerik)
-            
-            st.download_button(
-                label=f"📦 {proje_adi}_Ceviriler.zip İndir",
-                data=zip_buffer.getvalue(),
-                file_name=f"{proje_adi}_Ceviriler.zip",
-                mime="application/zip"
-            )
-            
-            with st.expander("Sonuçları Gör"):
-                for isim, icerik in sonuclar.items():
-                    st.text_area(isim, icerik[:1000] + "...", height=150)
+    st.subheader("Sistem Talimatı")
+    varsayilan_talimat = st.text_area("Çevirmen Kimliği", 
+        value="Sen profesyonel bir kitap çevirmenisin. Edebi, akıcı ve anlam odaklı çevir.", height=100)
 
-# --- 2. SEKME: EĞİTİM ---
-with tab2:
-    st.header("Stil Öğret")
-    st.markdown("Gemini'nin yaptığı hatayı ve senin düzeltmeni buraya gir.")
+# 2. ANA EKRAN YÖNETİMİ
+if 'aktif_proje_id' not in st.session_state:
+    st.session_state.aktif_proje_id = None
+
+# --- EKRAN A: PROJE LİSTESİ ---
+if st.session_state.aktif_proje_id is None:
+    st.title("🐱‍💻 Proje Yönetimi")
     
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([2, 1])
+    
     with col1:
-        ham_txt = st.text_area("Yapay Zeka Çevirisi", height=150)
-    with col2:
-        duzeltilmis_txt = st.text_area("Senin Düzeltmen", height=150)
+        st.subheader("Mevcut Projeler")
+        c = conn.cursor()
+        projeler = c.execute("SELECT * FROM projeler ORDER BY id DESC").fetchall()
         
-    if st.button("Analiz Et ve Kaydet"):
-        if api_key and ham_txt and duzeltilmis_txt:
-            with st.spinner("Analiz ediliyor..."):
-                try:
-                    yeni_kural = ders_cikar(ham_txt, duzeltilmis_txt, api_key)
-                    hafiza.append(yeni_kural)
-                    st.success("Yeni kural eklendi!")
-                    st.json(yeni_kural)
-                except Exception as e:
-                    st.error(f"Hata: {e}")
+        if not projeler:
+            st.info("Henüz hiç proje yok.")
+        
+        for p in projeler:
+            p_id, p_ad, p_tarih = p
+            # İlerleme durumunu hesapla
+            toplam = c.execute("SELECT COUNT(*) FROM paragraflar WHERE proje_id=?", (p_id,)).fetchone()[0]
+            biten = c.execute("SELECT COUNT(*) FROM paragraflar WHERE durum='onaylandi' AND proje_id=?", (p_id,)).fetchone()[0]
+            yuzde = int((biten/toplam)*100) if toplam > 0 else 0
+            
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([3, 2, 1])
+                c1.markdown(f"**{p_ad}**")
+                c2.progress(yuzde/100, text=f"%{yuzde} Tamamlandı ({biten}/{toplam})")
+                if c3.button("Aç", key=f"btn_{p_id}"):
+                    st.session_state.aktif_proje_id = p_id
+                    st.rerun()
+
+    with col2:
+        st.subheader("Yeni Proje Oluştur")
+        yeni_ad = st.text_input("Proje Adı")
+        dosya = st.file_uploader("Metin Dosyası (TXT, PDF, DOCX)")
+        
+        if st.button("Projeyi Yarat") and yeni_ad and dosya:
+            # 1. Metni Oku
+            metin = ""
+            if dosya.name.endswith(".pdf"):
+                reader = PdfReader(dosya)
+                for page in reader.pages: metin += page.extract_text() + "\n"
+            elif dosya.name.endswith(".docx"):
+                doc = Document(dosya)
+                for para in doc.paragraphs: metin += para.text + "\n"
+            else:
+                metin = dosya.read().decode("utf-8")
+            
+            # 2. Veritabanına Yaz
+            cur = conn.cursor()
+            cur.execute("INSERT INTO projeler (ad, olusturma_tarihi) VALUES (?, ?)", (yeni_ad, str(time.time())))
+            yeni_id = cur.lastrowid
+            
+            paragraflar = metni_parcala(metin)
+            for i, p in enumerate(paragraflar):
+                cur.execute("INSERT INTO paragraflar (proje_id, sira, orjinal_metin) VALUES (?, ?, ?)", 
+                            (yeni_id, i, p))
+            conn.commit()
+            st.success("Proje oluşturuldu! Listeden seçip açabilirsin.")
+            st.rerun()
+
+# --- EKRAN B: ÇEVİRİ EDİTÖRÜ ---
+else:
+    # Aktif projeyi çek
+    cur = conn.cursor()
+    proje = cur.execute("SELECT * FROM projeler WHERE id=?", (st.session_state.aktif_proje_id,)).fetchone()
     
+    # Geri Dön Butonu
+    if st.button("⬅️ Projelere Dön"):
+        st.session_state.aktif_proje_id = None
+        st.rerun()
+
+    st.markdown(f"## 📂 {proje[1]}")
+    st.caption(f"Kullanılan Model: {secilen_llm}")
     st.divider()
     
-    # HAFIZA İNDİRME
-    hafiza_json = json.dumps(hafiza, ensure_ascii=False, indent=4)
-    st.download_button(
-        label="💾 Hafızayı İndir (.json)",
-        data=hafiza_json,
-        file_name=f"{proje_adi}_hafiza.json",
-        mime="application/json"
-    )
+    # --- PRE-FETCH VE NAVİGASYON MANTIĞI ---
+    # İlk 'bekliyor' durumundaki paragrafı bul (Kaldığımız yer)
+    kalinan_yer = cur.execute("""
+        SELECT * FROM paragraflar 
+        WHERE proje_id=? AND durum='bekliyor' 
+        ORDER BY sira ASC LIMIT 1
+    """, (proje[0],)).fetchone()
+    
+    if not kalinan_yer:
+        st.balloons()
+        st.success("Tebrikler! Bu projedeki tüm çeviriler bitti.")
+    else:
+        aktif_id, pid, sira, orjinal, ceviri, durum = kalinan_yer
+        
+        # --- ARKA PLAN İŞLEMİ: BU VE SONRAKİ 2 PARAGRAFI ÇEVİR ---
+        # Şu anki ve sonraki 2 paragrafı çek
+        hedef_paragraflar = cur.execute("""
+            SELECT * FROM paragraflar 
+            WHERE proje_id=? AND sira >= ? 
+            ORDER BY sira ASC LIMIT 3
+        """, (pid, sira)).fetchall()
+        
+        with st.spinner("Yapay zeka analiz yapıyor..."):
+            for p_row in hedef_paragraflar:
+                p_id_temp, _, _, p_orj, p_cev, _ = p_row
+                # Eğer çevirisi yoksa veya boşsa çevir
+                if not p_cev:
+                    yeni_ceviri = ceviri_yap(p_orj, "gemini-2.5-pro", varsayilan_talimat)
+                    cur.execute("UPDATE paragraflar SET ceviri_metin=? WHERE id=?", (yeni_ceviri, p_id_temp))
+                    conn.commit()
+                    # Sayfayı yenilemeye gerek yok, altta güncelini göstereceğiz
+        
+        # Veriyi tekrar çek (güncellenmiş haliyle)
+        aktif_paragraf = cur.execute("SELECT * FROM paragraflar WHERE id=?", (aktif_id,)).fetchone()
+        _, _, _, guncel_orjinal, guncel_ceviri, _ = aktif_paragraf
+        
+        # --- EDİTÖR ALANI ---
+        col_sol, col_sag = st.columns(2)
+        
+        with col_sol:
+            st.markdown("### 🇬🇧 Orijinal")
+            st.info(guncel_orjinal)
+            
+        with col_sag:
+            st.markdown("### 🇹🇷 Çeviri")
+            duzeltilmis_metin = st.text_area("Düzenle:", value=guncel_ceviri, height=200, label_visibility="collapsed")
+            
+            c1, c2 = st.columns([1, 1])
+            if c1.button("✅ Onayla ve İlerle", type="primary"):
+                # Kaydet ve durumunu 'onaylandi' yap
+                cur.execute("UPDATE paragraflar SET ceviri_metin=?, durum='onaylandi' WHERE id=?", 
+                            (duzeltilmis_metin, aktif_id))
+                conn.commit()
+                st.rerun()
+                
+            if c2.button("Atla (Sonra Bakarım)"):
+                # Sadece sırayı atlamak için geçici çözüm, şimdilik onaylamadan geçebiliriz
+                # veya veritabanında 'atlandi' durumu eklenebilir. 
+                # Şimdilik onaylamış gibi davranıp sonuna ekliyoruz.
+                cur.execute("UPDATE paragraflar SET durum='onaylandi' WHERE id=?", (aktif_id,))
+                conn.commit()
+                st.rerun()
+
+        # --- GELECEK PARAGRAFLAR (ÖNİZLEME) ---
+        st.divider()
+        st.caption("👀 Sıradaki Paragraflar (Hazırlanıyor...)")
+        
+        sonrakiler = cur.execute("""
+            SELECT orjinal_metin, ceviri_metin FROM paragraflar 
+            WHERE proje_id=? AND sira > ? 
+            ORDER BY sira ASC LIMIT 2
+        """, (pid, sira)).fetchall()
+        
+        for sp in sonrakiler:
+            s_orj, s_cev = sp
+            with st.expander(f"{s_orj[:50]}..."):
+                st.markdown(f"**Orj:** {s_orj}")
+                st.markdown(f"**Taslak Çeviri:** {s_cev if s_cev else '⏳ Hazırlanıyor...'}")
