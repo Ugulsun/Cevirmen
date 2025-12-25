@@ -51,7 +51,7 @@ def save_project_to_drive(service, folder_id, project_data, project_name):
     
     # Veriyi hazırla
     media = MediaIoBaseUpload(io.BytesIO(json.dumps(project_data, ensure_ascii=False, indent=4).encode('utf-8')),
-                              mimetype='application/json', resumable=True)
+                              mimetype='application/json', resumable=False)
     
     if items:
         # Güncelle
